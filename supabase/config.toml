@@ -1,0 +1,8 @@
+[functions.ingest]
+verify_jwt = false
+
+[functions.jev-scan]
+verify_jwt = false
+
+[functions.llm]
+verify_jwt = false
