@@ -1,3 +1,4 @@
+import { FunctionsHttpError } from "@supabase/supabase-js";
 import { supabase } from "./supabase";
 import type { RunRecord, StepRecord, ScanBatchRecord, IncidentRecord, SeverityPolicy } from "./types";
 import type { StepAnswers } from "./assess";
@@ -5,18 +6,42 @@ import type { AssessResult } from "./types";
 import { assess } from "./assess";
 import { getSampleTrace } from "./sampleTraces";
 
+interface FunctionErrorBody {
+  error?: string;
+  message?: string;
+  mode?: string;
+}
+
+class FunctionCallError extends Error {
+  constructor(msg: string, readonly body: FunctionErrorBody | null) {
+    super(msg);
+    this.name = "FunctionCallError";
+  }
+}
+
+// Invokes an Edge Function. Non-2xx responses throw with the server's error message.
+async function invokeFunction<T>(name: string, body: string | Record<string, unknown>): Promise<T> {
+  const { data, error } = await supabase.functions.invoke(name, { body });
+  if (error) {
+    let errBody: FunctionErrorBody | null = null;
+    if (error instanceof FunctionsHttpError) {
+      try {
+        errBody = await error.context.json();
+      } catch { /* not JSON */ }
+    }
+    throw new FunctionCallError(errBody?.message || errBody?.error || error.message, errBody);
+  }
+  if (!data || typeof data !== "object") throw new Error(`${name} returned no data`);
+  if (data.error) throw new FunctionCallError(data.message || data.error, data);
+  return data as T;
+}
+
 // ============================================================
 // Ingest
 // ============================================================
 export async function ingestTrace(rawJson: string): Promise<{ run_id: string; step_count: number; source_format: string }> {
-  const { data, error } = await supabase.functions.invoke("ingest", {
-    body: rawJson,
-    headers: { "Content-Type": "application/json" },
-  });
-
-  if (error) throw error;
-  if (!data || data.error) throw new Error(data?.error || "Ingest failed");
-  return data;
+  // Raw text body: the trace may be JSON or JSONL.
+  return invokeFunction("ingest", rawJson);
 }
 
 // ============================================================
@@ -25,6 +50,8 @@ export async function ingestTrace(rawJson: string): Promise<{ run_id: string; st
 export interface ScanResult {
   run_id: string;
   scanned: number;
+  remaining?: number;
+  partial?: boolean;
   batches: number;
   total_cost_usd: number;
   total_latency_ms: number;
@@ -40,18 +67,14 @@ export interface ScanResult {
 }
 
 export async function scanRun(runId: string): Promise<ScanResult> {
-  const { data, error } = await supabase.functions.invoke("jev-scan", {
-    body: JSON.stringify({ run_id: runId }),
-  });
-
-  if (error) throw error;
-  if (!data || data.error) {
-    if (data?.mode === "replay") {
-      throw new ReplayModeError(data.error || "Daily limit reached");
+  try {
+    return await invokeFunction<ScanResult>("jev-scan", { run_id: runId });
+  } catch (e) {
+    if (e instanceof FunctionCallError && e.body?.mode === "replay") {
+      throw new ReplayModeError(e.message || "Daily limit reached");
     }
-    throw new Error(data?.error || "Scan failed");
+    throw e;
   }
-  return data;
 }
 
 export class ReplayModeError extends Error {
@@ -65,12 +88,10 @@ export class ReplayModeError extends Error {
 // LLM report
 // ============================================================
 export async function generateReport(runId: string): Promise<{ report: string; mock: boolean }> {
-  const { data, error } = await supabase.functions.invoke("llm", {
-    body: JSON.stringify({ action: "incident_report", run_id: runId }),
+  const data = await invokeFunction<{ report: string; mock?: boolean }>("llm", {
+    action: "incident_report",
+    run_id: runId,
   });
-
-  if (error) throw error;
-  if (!data || data.error) throw new Error(data?.error || "Report generation failed");
   return { report: data.report, mock: data.mock || false };
 }
 
@@ -83,7 +104,7 @@ export async function fetchRuns(): Promise<RunRecord[]> {
     .select("*")
     .order("created_at", { ascending: false });
   if (error) throw error;
-  return (data || []) as RunRecord[];
+  return ((data || []) as RunRecord[]).filter((r) => !hiddenRunIds.has(r.id));
 }
 
 export async function fetchSteps(runId: string): Promise<StepRecord[]> {
@@ -116,41 +137,55 @@ export async function fetchIncidents(runId: string): Promise<IncidentRecord[]> {
   return (data || []) as IncidentRecord[];
 }
 
-export async function updateStepSeverity(runId: string, idx: number, severity: string, firedRules: string[]): Promise<void> {
-  const { error } = await supabase
-    .from("steps")
-    .update({ severity, fired_rules: firedRules })
-    .eq("run_id", runId)
-    .eq("idx", idx);
-  if (error) throw error;
-}
+// ============================================================
+// Writes (browser has read-only table access; these go through the llm function)
+// ============================================================
+// Keeps each save request well under the function's 64 KB body limit.
+const SAVE_STEP_CHUNK = 100;
 
-export async function updateRunRiskScore(runId: string, score: number): Promise<void> {
-  const { error } = await supabase
-    .from("runs")
-    .update({ risk_score: score })
-    .eq("id", runId);
-  if (error) throw error;
-}
-
-export async function saveIncidents(runId: string, incidents: AssessResult["incidents"]): Promise<void> {
-  // Delete old incidents
-  await supabase.from("incidents").delete().eq("run_id", runId);
-  if (incidents.length === 0) return;
-  const rows = incidents.map((inc) => ({
+export async function saveAssessment(runId: string, result: AssessResult): Promise<void> {
+  for (let i = 0; i < result.stepResults.length; i += SAVE_STEP_CHUNK) {
+    const chunk = result.stepResults.slice(i, i + SAVE_STEP_CHUNK);
+    await invokeFunction("llm", {
+      action: "save_step_severities",
+      run_id: runId,
+      steps: chunk.map((sr) => ({ idx: sr.idx, severity: sr.severity, fired_rules: sr.firedRules })),
+    });
+  }
+  await invokeFunction("llm", {
+    action: "save_run_assessment",
     run_id: runId,
-    start_idx: inc.startIdx,
-    end_idx: inc.endIdx,
-    severity: inc.severity,
-    label: inc.label,
-  }));
-  const { error } = await supabase.from("incidents").insert(rows);
-  if (error) throw error;
+    risk_score: result.riskScore,
+    incidents: result.incidents.map((inc) => ({
+      start_idx: inc.startIdx,
+      end_idx: inc.endIdx,
+      severity: inc.severity,
+      label: inc.label,
+    })),
+  });
 }
 
-export async function deleteRun(runId: string): Promise<void> {
-  const { error } = await supabase.from("runs").delete().eq("id", runId);
-  if (error) throw error;
+// Deleting removes the run from this browser's view only; the shared demo data is kept.
+const HIDDEN_RUNS_STORAGE_KEY = "trace-forensics-hidden-runs";
+const MAX_HIDDEN_RUNS = 1000;
+
+function loadHiddenRunIds(): string[] {
+  try {
+    const stored = localStorage.getItem(HIDDEN_RUNS_STORAGE_KEY);
+    const ids = stored ? JSON.parse(stored) : [];
+    return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+const hiddenRunIds = new Set<string>(loadHiddenRunIds());
+
+export function hideRun(runId: string): void {
+  hiddenRunIds.add(runId);
+  try {
+    localStorage.setItem(HIDDEN_RUNS_STORAGE_KEY, JSON.stringify([...hiddenRunIds].slice(-MAX_HIDDEN_RUNS)));
+  } catch { /* storage unavailable: hidden until reload */ }
 }
 
 // ============================================================

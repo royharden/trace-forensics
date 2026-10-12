@@ -11,9 +11,8 @@ import { DEFAULT_POLICY, PRESETS, assess } from "@/lib/assess";
 import type { StepAnswers } from "@/lib/assess";
 import {
   ingestTrace, scanRun, generateReport, fetchRuns, fetchSteps,
-  fetchScanBatches, fetchIncidents, updateStepSeverity, updateRunRiskScore,
-  saveIncidents, deleteRun, parseJevResponses, replayAssess,
-  ReplayModeError,
+  fetchScanBatches, fetchIncidents, saveAssessment, hideRun,
+  parseJevResponses, replayAssess, ReplayModeError,
 } from "@/lib/api";
 import { SAMPLE_TRACES, getSampleTrace } from "@/lib/sampleTraces";
 
@@ -211,12 +210,8 @@ export default function App() {
     const result = replayAssess(sample.id, policy);
     if (!result) return;
 
-    // Update steps with severity
-    for (const sr of result.stepResults) {
-      await updateStepSeverity(run.id, sr.idx, sr.severity, sr.firedRules);
-    }
-    await updateRunRiskScore(run.id, result.riskScore);
-    await saveIncidents(run.id, result.incidents);
+    // Update steps with severity, run risk score and incidents
+    await saveAssessment(run.id, result);
 
     // Reload
     await loadRunDetails(run);
@@ -227,11 +222,7 @@ export default function App() {
     if (!selectedRun || stepAnswers.size === 0) return;
     const stepIndices = steps.map((s) => s.idx);
     const result = assess(stepAnswers, stepIndices, policy);
-    for (const sr of result.stepResults) {
-      await updateStepSeverity(selectedRun.id, sr.idx, sr.severity, sr.firedRules);
-    }
-    await updateRunRiskScore(selectedRun.id, result.riskScore);
-    await saveIncidents(selectedRun.id, result.incidents);
+    await saveAssessment(selectedRun.id, result);
     await loadRunDetails(selectedRun);
     await loadRuns();
   };
@@ -270,7 +261,7 @@ export default function App() {
 
   const handleDeleteRun = async (runId: string) => {
     try {
-      await deleteRun(runId);
+      hideRun(runId);
       if (selectedRun?.id === runId) {
         setSelectedRun(null);
         setSteps([]);

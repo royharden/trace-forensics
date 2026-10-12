@@ -38,7 +38,7 @@ graph TB
     subgraph Supabase Postgres
         DB[(runs, steps,<br/>scan_batches, incidents)]
         Usage[(usage_counters<br/>RLS locked)]
-        CounterFn[increment_usage_counter<br/>SECURITY DEFINER]
+        CounterFn[increment_usage_by<br/>SECURITY DEFINER]
     end
 
     subgraph External
@@ -104,7 +104,7 @@ All traces are normalized to this internal format:
 
 Auto-detection checks for the `steps` key (native), array shape (OpenAI), or `event` key in the first line (JSONL). If parsing fails, the error includes the offending line number.
 
-**Limits**: max 2 MB file size, max 500 steps.
+**Limits**: max 2 MB file size, max 500 steps, max 20 KB per step `content` and per step `args` (as JSON), `user_goal` up to 2,000 characters, `agent_name` up to 200. Oversized fields are rejected with HTTP 422.
 
 ## Bundled Sample Traces
 
@@ -119,7 +119,7 @@ Auto-detection checks for the `steps` key (native), array shape (OpenAI), or `ev
 
 ### 1. Supabase Project
 
-A Supabase project is provisioned automatically. The database migration (tables, RLS policies, `increment_usage_counter` function) is applied via the Supabase MCP tools.
+A Supabase project is provisioned automatically. The database migrations in `supabase/migrations/` (tables, RLS policies, the `increment_usage_by` counter function) are applied via the Supabase MCP tools.
 
 ### 2. Configure Secrets
 
@@ -157,7 +157,7 @@ npm run dev
 | `OPENAI_API_KEY` | OpenAI API key (server-side secret) | For LLM reports |
 | `OPENAI_BASE_URL` | OpenAI-compatible base URL (default: `https://api.openai.com/v1`) | No |
 | `OPENAI_MODEL` | LLM model (default: `gpt-4o-mini`) | No |
-| `DAILY_CALL_LIMIT` | Daily call limit per function (default: 200) | No |
+| `DAILY_CALL_LIMIT` | Daily cap on upstream API calls per function (default: 200) | No |
 
 ## Screenshots
 
@@ -189,14 +189,25 @@ Jev scans up to 8 steps per API call. This reduces the number of round-trips for
 
 ### Abuse Limits
 
-A `usage_counters` table tracks daily calls per function. It's locked down with RLS (no anon/authenticated policies) and only modifiable through a `SECURITY DEFINER` function revoked from all roles except `service_role`. When the limit is hit, the UI shows a banner and switches to Replay mode, which uses pre-scanned results for the bundled sample traces.
+A `usage_counters` table tracks daily upstream API calls per function (`jev-scan`, `llm`). It's locked down with RLS (no anon/authenticated policies or grants) and only modifiable through `increment_usage_by`, a `SECURITY DEFINER` function revoked from all roles except `service_role`. It adds to the counter atomically only while the total stays within the cap (default 200/day, `DAILY_CALL_LIMIT` overrides) and returns -1 otherwise.
+
+- Every TypeSafe and OpenAI fetch is counted right before it is made, including retries and split batches. Missing keys (Replay / mock modes) never count.
+- The check fails closed: a counter error or unexpected result returns 503 instead of calling upstream.
+- Retries happen only on 429, 529 or network errors, at most 2 attempts. A single scan request makes at most 20 Jev calls and scans at most 64 steps; click "Scan with Jev" again to continue a larger run.
+- Request bodies are size-capped (ingest 2 MB, llm 64 KB) and fields are length-capped before any paid call or prompt building.
+
+When the limit is hit, the UI shows a banner and switches to Replay mode, which uses pre-scanned results for the bundled sample traces.
+
+### Access Control
+
+All three Edge Functions run with `verify_jwt = true`; the browser calls them via `supabase.functions.invoke`, which sends the anon key as a bearer token. Browser clients only have read access to `runs`, `steps`, `scan_batches` and `incidents`. Writes happen in Edge Functions with the service-role client: `ingest` stores traces, `jev-scan` stores scan batches, and `llm` saves re-scored severities, risk scores and incidents (whitelisted columns, bounded payloads). Deleting a run hides it in your browser only; shared demo data is not deleted.
 
 ### Three Edge Functions
 
 Bolt's deploy limit means we use exactly 3 edge functions:
 1. `ingest` — parse, normalize, and store traces
 2. `jev-scan` — batch and call the Jev API
-3. `llm` — generate incident reports (with mock fallback)
+3. `llm` — generate incident reports (with mock fallback), and save severity re-assessments (`save_step_severities`, `save_run_assessment`)
 
 ### Dark Forensics Lab UI
 

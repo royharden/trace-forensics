@@ -1,10 +1,23 @@
-import { createClient } from "npm:@supabase/supabase-js@2.57.4";
+import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.57.4";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
+
+// --- Request limits ---
+const MAX_FILE_BYTES = 2 * 1024 * 1024;
+const MULTIPART_OVERHEAD_BYTES = 64 * 1024;
+const MAX_STEPS = 500;
+const MAX_FIELD_CHARS = 20 * 1024; // per-step content, and per-step args as JSON
+const MAX_GOAL_CHARS = 2000;
+const MAX_AGENT_NAME_CHARS = 200;
+const MAX_TOOL_CHARS = 200;
+const MAX_ACTOR_CHARS = 100;
+const MAX_TS_CHARS = 64;
+const MAX_STEP_IDX = 1_000_000;
+const STEP_TYPES = new Set(["thought", "tool_call", "tool_result", "message"]);
 
 interface NormalizedStep {
   idx: number;
@@ -183,61 +196,152 @@ function normalizeTrace(body: string | unknown): { trace: NormalizedTrace; forma
   return { trace: parseJSONL(text), format };
 }
 
+function json(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
+function getServiceClient(): SupabaseClient | null {
+  const url = Deno.env.get("SUPABASE_URL");
+  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!url || !key) return null;
+  return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+}
+
+// Reads the request body, giving up once it exceeds maxBytes. Returns null when too large.
+async function readBodyCapped(req: Request, maxBytes: number): Promise<Uint8Array | null> {
+  if (!req.body) return new Uint8Array(0);
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.byteLength;
+  }
+  return out;
+}
+
+function tooLong(v: unknown, max: number): boolean {
+  return v !== null && v !== undefined && (typeof v !== "string" || v.length > max);
+}
+
+// Per-field limits on the normalized trace. Returns an error message, or null when valid.
+function validateTrace(trace: NormalizedTrace): string | null {
+  if (typeof trace.agent_name !== "string" || trace.agent_name.length > MAX_AGENT_NAME_CHARS) {
+    return `agent_name must be a string of at most ${MAX_AGENT_NAME_CHARS} characters`;
+  }
+  if (typeof trace.user_goal !== "string" || trace.user_goal.length > MAX_GOAL_CHARS) {
+    return `user_goal must be a string of at most ${MAX_GOAL_CHARS} characters`;
+  }
+  for (const [i, s] of trace.steps.entries()) {
+    if (!Number.isInteger(s.idx) || s.idx < 0 || s.idx > MAX_STEP_IDX) {
+      return `Step ${i}: idx must be an integer between 0 and ${MAX_STEP_IDX}`;
+    }
+    if (!STEP_TYPES.has(s.type)) {
+      return `Step ${s.idx}: type must be one of thought, tool_call, tool_result, message`;
+    }
+    if (tooLong(s.content, MAX_FIELD_CHARS)) {
+      return `Step ${s.idx}: content exceeds ${MAX_FIELD_CHARS} characters`;
+    }
+    if (s.args !== null && s.args !== undefined) {
+      if (typeof s.args !== "object" || Array.isArray(s.args)) {
+        return `Step ${s.idx}: args must be an object`;
+      }
+      if (JSON.stringify(s.args).length > MAX_FIELD_CHARS) {
+        return `Step ${s.idx}: args exceed ${MAX_FIELD_CHARS} characters`;
+      }
+    }
+    if (tooLong(s.tool, MAX_TOOL_CHARS)) return `Step ${s.idx}: tool exceeds ${MAX_TOOL_CHARS} characters`;
+    if (tooLong(s.actor, MAX_ACTOR_CHARS)) return `Step ${s.idx}: actor exceeds ${MAX_ACTOR_CHARS} characters`;
+    if (tooLong(s.ts, MAX_TS_CHARS)) return `Step ${s.idx}: ts exceeds ${MAX_TS_CHARS} characters`;
+  }
+  return null;
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
   }
+  if (req.method !== "POST") {
+    return json(405, { error: "Method not allowed" });
+  }
+
+  const supabase = getServiceClient();
+  if (!supabase) {
+    console.error("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not set");
+    return json(503, { error: "Service not configured" });
+  }
 
   try {
     const contentType = req.headers.get("content-type") || "";
-    let rawBody: string;
+    const isMultipart = contentType.includes("multipart/form-data");
+    const maxBodyBytes = isMultipart ? MAX_FILE_BYTES + MULTIPART_OVERHEAD_BYTES : MAX_FILE_BYTES;
 
-    if (contentType.includes("multipart/form-data")) {
-      const formData = await req.formData();
+    // 2 MB cap: check the declared length before reading, then enforce while reading
+    const declared = req.headers.get("content-length");
+    if (declared !== null && Number(declared) > maxBodyBytes) {
+      return json(413, { error: "File exceeds 2 MB limit" });
+    }
+    const bytes = await readBodyCapped(req, maxBodyBytes);
+    if (!bytes) {
+      return json(413, { error: "File exceeds 2 MB limit" });
+    }
+
+    let rawBody: string;
+    if (isMultipart) {
+      let formData: FormData;
+      try {
+        formData = await new Response(bytes.buffer as ArrayBuffer, { headers: { "content-type": contentType } }).formData();
+      } catch {
+        return json(400, { error: "Invalid multipart body" });
+      }
       const file = formData.get("file");
       if (!file || !(file instanceof File)) {
-        return new Response(JSON.stringify({ error: "No file provided" }), {
-          status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
+        return json(400, { error: "No file provided" });
+      }
+      if (file.size > MAX_FILE_BYTES) {
+        return json(413, { error: "File exceeds 2 MB limit" });
       }
       rawBody = await file.text();
     } else {
-      rawBody = await req.text();
-    }
-
-    // 2 MB cap
-    if (rawBody.length > 2 * 1024 * 1024) {
-      return new Response(JSON.stringify({ error: "File exceeds 2 MB limit" }), {
-        status: 413, headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      rawBody = new TextDecoder().decode(bytes);
     }
 
     let parsed: { trace: NormalizedTrace; format: string };
     try {
       parsed = normalizeTrace(rawBody);
     } catch (e) {
-      return new Response(JSON.stringify({ error: `Parse error: ${(e as Error).message}` }), {
-        status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      return json(400, { error: `Parse error: ${(e as Error).message}` });
     }
 
     const { trace, format } = parsed;
 
     // 500 step cap
-    if (trace.steps.length > 500) {
-      return new Response(JSON.stringify({ error: `Trace has ${trace.steps.length} steps, exceeding the 500 step limit` }), {
-        status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+    if (trace.steps.length > MAX_STEPS) {
+      return json(400, { error: `Trace has ${trace.steps.length} steps, exceeding the ${MAX_STEPS} step limit` });
     }
     if (trace.steps.length === 0) {
-      return new Response(JSON.stringify({ error: "Trace has no steps" }), {
-        status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      return json(400, { error: "Trace has no steps" });
     }
 
-    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-    const supabase = createClient(supabaseUrl, serviceRoleKey);
+    const invalid = validateTrace(trace);
+    if (invalid) {
+      return json(422, { error: invalid });
+    }
 
     // Insert run
     const { data: run, error: runErr } = await supabase
@@ -253,9 +357,8 @@ Deno.serve(async (req: Request) => {
       .single();
 
     if (runErr || !run) {
-      return new Response(JSON.stringify({ error: `Failed to create run: ${runErr?.message}` }), {
-        status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      if (runErr) console.error("Failed to create run:", runErr.message);
+      return json(500, { error: "Failed to create run" });
     }
 
     // Insert steps in batches of 100
@@ -274,22 +377,20 @@ Deno.serve(async (req: Request) => {
       const batch = stepRows.slice(i, i + 100);
       const { error: stepErr } = await supabase.from("steps").insert(batch);
       if (stepErr) {
-        return new Response(JSON.stringify({ error: `Failed to insert steps: ${stepErr.message}` }), {
-          status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
+        console.error("Failed to insert steps:", stepErr.message);
+        // Don't leave a run with missing steps behind
+        await supabase.from("runs").delete().eq("id", run.id);
+        return json(500, { error: "Failed to insert steps" });
       }
     }
 
-    return new Response(JSON.stringify({
+    return json(200, {
       run_id: run.id,
       step_count: trace.steps.length,
       source_format: format,
-    }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (err) {
-    return new Response(JSON.stringify({ error: (err as Error).message }), {
-      status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    console.error("ingest error:", err);
+    return json(500, { error: "Internal error" });
   }
 });
